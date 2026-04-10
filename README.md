@@ -4,7 +4,7 @@ MCP server that indexes and searches all your Claude Code conversation history, 
 
 ## What it does
 
-Indexes ~1700+ Claude Code sessions and extracts structured knowledge:
+Indexes all your Claude Code sessions and extracts structured knowledge:
 
 - **Message scoring** — Every message is scored for importance (0-1) and typed (conclusion, solution, exploration, error_report, question). Search prioritizes conclusions over debugging noise.
 - **Decision extraction** — Automatically detects decisions with rationale from conversation patterns ("chose X because Y", "switched to X", "the fix is").
@@ -130,7 +130,7 @@ SQLite via **sql.js** (pure WASM — no native modules, works in any Node/Bun ru
 
 ### Indexing
 
-- **Full build**: ~10s for 1700 sessions (35K messages, 29K tool usages, 1100+ insights)
+- **Full build**: ~10s for ~1700 sessions on a typical machine
 - **Incremental**: <700ms (mtime-based, only re-indexes changed files)
 - Index stored at `~/.claude/past-conversations-index.db`
 
