@@ -31,12 +31,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "compromise": "^14.15.0",
     "sql.js": "^1.11.0",
+    "wink-sentiment": "^5.0.2",
     "zod": "^3.25.0"
   },
   "devDependencies": {
-    "@types/sql.js": "^1.4.9",
     "@types/node": "^22.0.0",
+    "@types/sql.js": "^1.4.9",
     "typescript": "^5.7.0"
   }
 }

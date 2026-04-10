@@ -1,4 +1,5 @@
 import type { ParsedConversation } from "./jsonl.js";
+import { extractSentenceAround } from "../utils/nlp.js";
 
 export interface InsightRecord {
   type: string;
@@ -21,18 +22,24 @@ export interface ExtractionResult {
   crossRefs: CrossRefRecord[];
 }
 
-// Decision patterns: "chose X because Y", "switched to X", etc.
-const DECISION_PATTERNS = [
-  /\b(chose|choosing|picked|switched to|migrated? to|replaced? .{1,30} with|going with|decided to|we(?:'ll| will) use)\b/i,
-  /\b(the reason (?:is|was)|because of|due to|in order to|to avoid|the (?:right|best|correct) approach)\b/i,
-  /\b(trade-?off|alternative|instead of|rather than|over .{1,20} because)\b/i,
+// ---- Principle patterns: require BOTH a directive AND scope/rationale ----
+
+const PRINCIPLE_PATTERNS = [
+  // Prescriptive rules with scope (tight gap to avoid matching unrelated clauses)
+  /\b(don't|do not|never|avoid)\b.{1,50}\b(when|if|unless|instead)\b/i,
+  /\b(always|must|should not)\b.{1,50}\b(when|if|unless|before|after|instead)\b/i,
+  // Explicit decision with rationale (tight co-occurrence)
+  /\b(?:chose|switched to|going with|we'll use)\b.{1,60}\b(?:because|since|to avoid|instead of)\b/i,
+  // Trade-off analysis with resolution
+  /\b(?:trade-?off|pros and cons).{1,40}(?:chose|going with|decided|better)\b/i,
+  // Root cause with explanation
+  /\b(?:root cause|the (?:real )?(?:issue|problem|bug) was)\b.{1,80}\b(?:because|due to|caused by)\b/i,
 ];
 
-// Error-fix patterns
-const FIX_PATTERNS = [
+// Error-fix summary patterns (used to extract the summary sentence from structurally-confirmed fixes)
+const FIX_SUMMARY_PATTERNS = [
   /\b(fixed by|the fix(?::|is| was)|resolved by|solution:|the problem was)\b/i,
-  /\b(root cause:|the issue (?:is|was)|the bug (?:is|was)|caused by)\b/i,
-  /\b(changing .{1,40} to .{1,40} (?:fixed|resolved|solved))\b/i,
+  /\b(root cause:|the issue (?:is|was)|caused by)\b/i,
 ];
 
 // Cross-project reference patterns
@@ -40,20 +47,6 @@ const CROSS_REF_PATTERNS = [
   /\b(?:from|in|see|like|copied from|same (?:pattern|approach) as) the ([a-z][\w-]+) project\b/i,
   /\b(?:copied|ported|borrowed|taken) from ([a-z][\w-]+)\b/i,
 ];
-
-// Tag keyword map
-const TAG_KEYWORDS: Record<string, string[]> = {
-  refactoring: ['refactor', 'restructure', 'reorganize', 'clean up', 'rewrite'],
-  bugfix: ['bug', 'fix', 'broken', 'regression', 'patch'],
-  testing: ['test', 'spec', 'jest', 'vitest', 'assertion', 'coverage'],
-  devops: ['deploy', 'ci', 'cd', 'pipeline', 'docker', 'kubernetes', 'build'],
-  database: ['schema', 'migration', 'sqlite', 'postgres', 'mysql', 'query', 'index'],
-  api: ['api', 'endpoint', 'route', 'rest', 'graphql', 'handler'],
-  frontend: ['component', 'css', 'layout', 'react', 'vue', 'svelte', 'ui'],
-  performance: ['perf', 'optimize', 'cache', 'latency', 'benchmark', 'profil'],
-  security: ['auth', 'permission', 'token', 'encrypt', 'credential', 'oauth'],
-  mcp: ['mcp', 'tool_use', 'mcp server', 'stdio transport'],
-};
 
 // File extension to language tag
 const EXT_TAGS: Record<string, string> = {
@@ -70,133 +63,23 @@ const EXT_TAGS: Record<string, string> = {
   '.sh': 'shell', '.bash': 'shell',
 };
 
-function extractSentences(text: string, around: RegExp, maxLen: number = 300): { summary: string; detail: string } {
-  const match = around.exec(text);
-  if (!match || match.index === undefined) return { summary: '', detail: '' };
+// ---- NLP-based sentence extraction around a pattern match ----
 
-  // Find sentence boundaries around the match
-  const before = text.slice(Math.max(0, match.index - 200), match.index);
-  const after = text.slice(match.index, Math.min(text.length, match.index + 300));
-  const combined = before + after;
-
-  // Get the sentence containing the match
-  const sentences = combined.split(/(?<=[.!?\n])\s+/).filter(s => s.trim());
-  const matchStr = match[0].toLowerCase();
-  const matchingSentence = sentences.find(s => s.toLowerCase().includes(matchStr)) ?? combined.slice(0, maxLen);
-
-  const summary = matchingSentence.trim().slice(0, maxLen);
-  const detail = combined.trim().slice(0, maxLen * 2);
-  return { summary, detail };
+function extractSentences(text: string, pattern: RegExp, maxLen: number = 300): { summary: string; detail: string } {
+  const result = extractSentenceAround(text, pattern, 1);
+  if (!result) return { summary: '', detail: '' };
+  return {
+    summary: result.matchSentence.slice(0, maxLen),
+    detail: result.context.slice(0, maxLen * 2),
+  };
 }
 
-export function extractKnowledge(
-  parsed: ParsedConversation,
-  sourceProject: string,
-  knownProjects: string[],
-): ExtractionResult {
-  const insights: InsightRecord[] = [];
+// ---- Structural tag computation ----
+
+function computeStructuralTags(parsed: ParsedConversation): string[] {
   const tags = new Set<string>();
-  const crossRefs: CrossRefRecord[] = [];
 
-  const seenInsights = new Set<string>();
-
-  for (const msg of parsed.messages) {
-    if (msg.role !== 'assistant') continue;
-    const content = msg.content;
-
-    // Decision extraction
-    for (const pattern of DECISION_PATTERNS) {
-      if (pattern.test(content)) {
-        const { summary, detail } = extractSentences(content, pattern);
-        if (summary && !seenInsights.has(summary.slice(0, 50))) {
-          seenInsights.add(summary.slice(0, 50));
-          // Higher confidence if multiple decision words in same message
-          const matchCount = DECISION_PATTERNS.filter(p => p.test(content)).length;
-          insights.push({
-            type: 'decision',
-            summary,
-            detail,
-            confidence: Math.min(1.0, 0.4 + matchCount * 0.15),
-            sourceIndex: msg.messageIndex,
-          });
-        }
-        break; // one decision per message
-      }
-    }
-
-    // Error-fix extraction
-    for (const pattern of FIX_PATTERNS) {
-      if (pattern.test(content)) {
-        const { summary, detail } = extractSentences(content, pattern);
-        if (summary && !seenInsights.has(summary.slice(0, 50))) {
-          seenInsights.add(summary.slice(0, 50));
-          const matchCount = FIX_PATTERNS.filter(p => p.test(content)).length;
-          insights.push({
-            type: 'error_fix',
-            summary,
-            detail,
-            confidence: Math.min(1.0, 0.5 + matchCount * 0.15),
-            sourceIndex: msg.messageIndex,
-          });
-        }
-        break;
-      }
-    }
-
-    // Cross-project references: filesystem paths
-    for (const projPath of knownProjects) {
-      if (projPath === sourceProject) continue;
-      if (content.includes(projPath)) {
-        const projName = projPath.split('/').pop() ?? projPath;
-        // Get surrounding context
-        const idx = content.indexOf(projPath);
-        const context = content.slice(Math.max(0, idx - 80), Math.min(content.length, idx + projPath.length + 80)).trim();
-        const key = `${projPath}:${msg.messageIndex}`;
-        if (!seenInsights.has(key)) {
-          seenInsights.add(key);
-          crossRefs.push({
-            targetProject: projPath,
-            type: 'path_mention',
-            context,
-            messageIndex: msg.messageIndex,
-          });
-        }
-      }
-    }
-
-    // Cross-project references: natural language
-    for (const pattern of CROSS_REF_PATTERNS) {
-      const match = pattern.exec(content);
-      if (match?.[1]) {
-        const refName = match[1];
-        const matchedProject = knownProjects.find(p =>
-          p.endsWith('/' + refName) || p.endsWith('/' + refName.replace(/-/g, '/'))
-        );
-        if (matchedProject && matchedProject !== sourceProject) {
-          const key = `${matchedProject}:${msg.messageIndex}`;
-          if (!seenInsights.has(key)) {
-            seenInsights.add(key);
-            crossRefs.push({
-              targetProject: matchedProject,
-              type: 'copy_from',
-              context: content.slice(Math.max(0, (match.index ?? 0) - 50), (match.index ?? 0) + match[0].length + 50).trim(),
-              messageIndex: msg.messageIndex,
-            });
-          }
-        }
-      }
-    }
-  }
-
-  // Tag extraction: from content keywords
-  const allText = parsed.messages.slice(0, 5).map(m => m.content).join(' ').toLowerCase();
-  for (const [tag, keywords] of Object.entries(TAG_KEYWORDS)) {
-    if (keywords.some(kw => allText.includes(kw))) {
-      tags.add(tag);
-    }
-  }
-
-  // Tag extraction: from file extensions in tool usage
+  // Language tags from file extensions (structural)
   for (const tu of parsed.toolUses) {
     if (tu.filePath) {
       const ext = tu.filePath.match(/\.[a-z]+$/)?.[0];
@@ -206,5 +89,186 @@ export function extractKnowledge(
     }
   }
 
-  return { insights, tags: [...tags], crossRefs };
+  // Activity tags from tool patterns
+  let writeOps = 0;
+  let readOps = 0;
+  for (const tu of parsed.toolUses) {
+    if (tu.toolName === 'Write' || tu.toolName === 'Edit') writeOps++;
+    if (tu.toolName === 'Read' || tu.toolName === 'Grep' || tu.toolName === 'Glob') readOps++;
+  }
+
+  if (parsed.errorFixPairs.length >= 2) tags.add('debugging');
+  if (writeOps >= 5 && parsed.errorCount <= 1) tags.add('refactoring');
+  if (readOps > writeOps * 3 && writeOps <= 2) tags.add('investigation');
+
+  // File-path based tags
+  const filePaths = parsed.toolUses.map(t => t.filePath).filter(Boolean) as string[];
+  if (filePaths.some(f => /\.(test|spec)\.[tj]sx?$/.test(f) || f.includes('__tests__') || /\/test\//.test(f))) tags.add('testing');
+  if (filePaths.some(f => /\b(Dockerfile|docker-compose|\.github|ci\.yml|cd\.yml|Makefile)\b/.test(f))) tags.add('devops');
+  if (filePaths.some(f => /\.(sql|prisma)$/.test(f) || /\b(migration|schema)\b/i.test(f))) tags.add('database');
+  if (filePaths.some(f => /\b(route|endpoint|handler|controller|api)\b/i.test(f))) tags.add('api');
+  if (filePaths.some(f => /\.(css|scss|svelte|vue)$/.test(f) || /\bcomponent/i.test(f))) tags.add('frontend');
+
+  // Bash command based tags
+  for (const turn of parsed.turns) {
+    for (const tc of turn.assistantToolCalls) {
+      if (tc.bashCommand) {
+        if (/\b(npm test|jest|vitest|pytest|cargo test|go test)\b/.test(tc.bashCommand)) tags.add('testing');
+        if (/\b(docker|kubectl|terraform|ansible)\b/.test(tc.bashCommand)) tags.add('devops');
+        if (/\b(git commit|git push|git merge)\b/.test(tc.bashCommand)) tags.add('git-workflow');
+      }
+    }
+  }
+
+  // Outcome-based tags
+  if (parsed.commitCount > 0) tags.add('productive');
+  if (parsed.errorFixPairs.length > 0 && parsed.commitCount > 0) tags.add('bugfix');
+
+  return [...tags];
+}
+
+// ---- Main extraction function ----
+
+export function extractKnowledge(
+  parsed: ParsedConversation,
+  sourceProject: string,
+  knownProjects: string[],
+): ExtractionResult {
+  const insights: InsightRecord[] = [];
+  const crossRefs: CrossRefRecord[] = [];
+  const seenInsights = new Set<string>();
+
+  // Pre-compute structural lookup sets
+  const fixTurnSet = new Set(parsed.errorFixPairs.map(p => p.fixTurnIndex));
+  const preCommitSet = new Set<number>();
+  for (const ci of parsed.commitTurnIndices) {
+    if (ci - 1 >= 0) preCommitSet.add(ci - 1);
+    if (ci - 2 >= 0) preCommitSet.add(ci - 2);
+  }
+  const totalTurns = parsed.turns.length;
+
+  // ---- Decision extraction: principle patterns + structural validation ----
+
+  for (const turn of parsed.turns) {
+    if (!turn.assistantText) continue;
+    const content = turn.assistantText;
+    const ti = turn.turnIndex;
+    const positionRatio = totalTurns > 1 ? ti / (totalTurns - 1) : 0;
+
+    // Pass 1: check for principle patterns
+    for (const pattern of PRINCIPLE_PATTERNS) {
+      if (!pattern.test(content)) continue;
+
+      const { summary, detail } = extractSentences(content, pattern);
+      if (!summary || seenInsights.has(summary.slice(0, 50))) continue;
+
+      // Pass 2: structural validation — at least one condition must hold
+      let conditionCount = 0;
+      let confidence = 0.4;
+
+      // Previous user was negative (this is the corrected approach)
+      const isPostRejection = turn.userFeedback === 'negative' ||
+        (ti > 0 && parsed.turns[ti - 1]?.userFeedback === 'negative');
+      if (isPostRejection) { conditionCount++; confidence += 0.20; }
+
+      // Next user confirmed
+      const nextFeedback = ti + 1 < totalTurns ? parsed.turns[ti + 1]?.userFeedback : null;
+      if (nextFeedback === 'positive') { conditionCount++; confidence += 0.15; }
+
+      // Near a commit
+      if (preCommitSet.has(ti)) { conditionCount++; confidence += 0.15; }
+
+      // Resolves an error
+      if (fixTurnSet.has(ti)) { conditionCount++; confidence += 0.10; }
+
+      // Substantive and not early exploration
+      if (content.length > 200 && positionRatio > 0.3) { conditionCount++; confidence += 0.05; }
+
+      // Discard if no structural conditions met
+      if (conditionCount === 0) continue;
+
+      seenInsights.add(summary.slice(0, 50));
+      insights.push({
+        type: 'decision',
+        summary,
+        detail,
+        confidence: Math.min(0.95, confidence),
+        sourceIndex: ti,
+      });
+      break; // one decision per turn
+    }
+
+    // ---- Cross-project references (unchanged — already structural) ----
+
+    for (const projPath of knownProjects) {
+      if (projPath === sourceProject) continue;
+      if (!content.includes(projPath)) continue;
+      const idx = content.indexOf(projPath);
+      const context = content.slice(Math.max(0, idx - 80), Math.min(content.length, idx + projPath.length + 80)).trim();
+      const key = `${projPath}:${ti}`;
+      if (!seenInsights.has(key)) {
+        seenInsights.add(key);
+        crossRefs.push({ targetProject: projPath, type: 'path_mention', context, messageIndex: ti });
+      }
+    }
+
+    for (const pattern of CROSS_REF_PATTERNS) {
+      const match = pattern.exec(content);
+      if (!match?.[1]) continue;
+      const matchedProject = knownProjects.find(p =>
+        p.endsWith('/' + match[1]) || p.endsWith('/' + match[1].replace(/-/g, '/'))
+      );
+      if (matchedProject && matchedProject !== sourceProject) {
+        const key = `${matchedProject}:${ti}`;
+        if (!seenInsights.has(key)) {
+          seenInsights.add(key);
+          crossRefs.push({
+            targetProject: matchedProject,
+            type: 'copy_from',
+            context: content.slice(Math.max(0, (match.index ?? 0) - 50), (match.index ?? 0) + match[0].length + 50).trim(),
+            messageIndex: ti,
+          });
+        }
+      }
+    }
+  }
+
+  // ---- Error-fix extraction: from structural pairs, not regex ----
+
+  for (const pair of parsed.errorFixPairs) {
+    const fixTurn = parsed.turns[pair.fixTurnIndex];
+    if (!fixTurn?.assistantText) continue;
+
+    const content = fixTurn.assistantText;
+    const key = `errorfix:${pair.fixTurnIndex}`;
+    if (seenInsights.has(key)) continue;
+    seenInsights.add(key);
+
+    // Use FIX_SUMMARY_PATTERNS to extract the best summary sentence, or fall back to first 300 chars
+    let summary = content.slice(0, 300);
+    let detail = content.slice(0, 600);
+    for (const pattern of FIX_SUMMARY_PATTERNS) {
+      if (pattern.test(content)) {
+        const extracted = extractSentences(content, pattern);
+        if (extracted.summary) {
+          summary = extracted.summary;
+          detail = extracted.detail;
+          break;
+        }
+      }
+    }
+
+    insights.push({
+      type: 'error_fix',
+      summary,
+      detail,
+      confidence: 0.7, // structurally confirmed — we KNOW it fixed an error
+      sourceIndex: pair.fixTurnIndex,
+    });
+  }
+
+  // ---- Tags: structural only ----
+  const tags = computeStructuralTags(parsed);
+
+  return { insights, tags, crossRefs };
 }

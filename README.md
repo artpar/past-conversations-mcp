@@ -6,12 +6,15 @@ MCP server that indexes and searches all your Claude Code conversation history, 
 
 Indexes all your Claude Code sessions and extracts structured knowledge:
 
-- **Message scoring** — Every message is scored for importance (0-1) and typed (conclusion, solution, exploration, error_report, question). Search prioritizes conclusions over debugging noise.
-- **Decision extraction** — Automatically detects decisions with rationale from conversation patterns ("chose X because Y", "switched to X", "the fix is").
+- **Turn-based conversation model** — Groups JSONL records into logical turns (user prompt → assistant response cycle), tracking tool results, errors, commits, and user feedback per turn. This structural context drives all downstream analysis.
+- **Message scoring** — Every message is scored for importance (0-1) and typed (conclusion, solution, exploration, error_report, question). Scoring uses structural signals (pre-commit position, error→fix resolution, user confirmation) as primary factors, with content patterns as tiebreakers.
+- **Decision extraction** — Detects generalizable principles ("don't X when Y", "chose X because Z") validated by structural gates: user confrontation before, action taken after, user confirmation, or proximity to commits. Eliminates debugging noise that contains decision-like words.
+- **Error-fix detection** — Structurally proven: identifies turns where tool results had errors, then finds the resolution turn where tools succeeded. No regex needed for detection — structure proves causality.
 - **Session outcomes** — Computes whether sessions ended successfully, partially, with errors, or were abandoned.
 - **Cross-project references** — Detects when one project references another (filesystem paths, "copied from X project").
-- **Auto-tagging** — Tags sessions by language (typescript, golang, python), activity (refactoring, bugfix, testing, devops), and domain (api, database, frontend).
+- **Structural tagging** — Tags sessions by what tools were used, what files were touched, and what commands were run — not by content keywords. `testing` requires actual test files or test runner commands, not the word "test" in text.
 - **Importance ranking** — Sessions scored by commits, file breadth, outcome, and cross-references.
+- **NLP text analysis** — Uses [compromise](https://github.com/spencermountain/compromise) for sentence boundary detection and [wink-sentiment](https://github.com/winkjs/wink-sentiment) (AFINN-165 lexicon) for user feedback classification. Both deterministic, pure JS, no native deps.
 
 ## Installation
 
@@ -30,7 +33,7 @@ Add to `~/.claude.json`:
 }
 ```
 
-Restart Claude Code. First startup takes ~10s to build the index. Subsequent startups are <700ms (incremental).
+Restart Claude Code. First startup takes ~17s to build the index. Subsequent startups are <700ms (incremental).
 
 ### From source
 
@@ -44,7 +47,7 @@ node dist/index.js
 
 ## Tools (11)
 
-### Knowledge tools (new in v2)
+### Knowledge tools
 
 | Tool | Description |
 |------|-------------|
@@ -92,11 +95,11 @@ src/
 │   ├── indexer.ts            Build/incremental index pipeline
 │   └── queries.ts           All query functions
 ├── parser/
-│   ├── jsonl.ts             Conversation JSONL parsing + enrichment
+│   ├── jsonl.ts             Turn-based JSONL parsing with structural enrichment
 │   ├── history.ts           history.jsonl streaming
 │   ├── project.ts           Project/session discovery
 │   ├── subagent.ts          Subagent file parsing
-│   └── extractor.ts         Decision/error-fix/cross-ref/tag extraction
+│   └── extractor.ts         Principle detection + structural tag extraction
 ├── tools/
 │   ├── search.ts            search_conversations, search_history
 │   ├── sessions.ts          list_sessions, get_session, get_session_context
@@ -106,7 +109,24 @@ src/
 └── utils/
     ├── paths.ts             Path/slug utilities
     ├── text.ts              Text extraction helpers
-    └── scoring.ts           Message importance scoring heuristics
+    ├── nlp.ts               NLP utilities (compromise + wink-sentiment)
+    └── scoring.ts           Turn-based importance scoring
+```
+
+### Extraction pipeline
+
+```
+JSONL records
+  → Group by message.id into logical messages
+  → Pair user prompts with assistant responses into turns
+  → Track tool result errors/successes per turn
+  → Classify user feedback via sentiment analysis
+  → Build errorFixPairs (structural error→resolution sequences)
+  → Build commitTurnIndices (turns containing git commits)
+  → Score turns using structural context (pre-commit, error-fix, user confirmation)
+  → Extract decisions via principle patterns + structural validation gates
+  → Extract error-fixes from structural pairs (no regex for detection)
+  → Compute structural tags from tool usage, file paths, bash commands
 ```
 
 ### Database
@@ -130,16 +150,30 @@ SQLite via **sql.js** (pure WASM — no native modules, works in any Node/Bun ru
 
 ### Indexing
 
-- **Full build**: ~10s for ~1700 sessions on a typical machine
+- **Full build**: ~17s for ~1700 sessions on a typical machine
 - **Incremental**: <700ms (mtime-based, only re-indexes changed files)
 - Index stored at `~/.claude/past-conversations-index.db`
 
 ## Key design choices
 
+- **Turn-based model over flat messages** — Conversations are trees of records linked by parentUuid. Grouping into turns captures tool result context, user feedback, and stop_reason that flat message lists lose.
+- **Structural signals over content patterns** — Scoring and extraction use conversation structure (what happened before/after, did tools succeed, did user confirm) as primary signals. Content regex patterns are tiebreakers, not drivers.
+- **Principle detection over keyword matching** — Decision extraction requires co-occurrence of a directive AND scope/rationale in the same text, plus at least one structural validation gate. Eliminates debugging traces that contain decision-like words.
+- **Structural tags over content keywords** — Tags derived from what tools were used and what files were touched, not from keywords in text. "testing" requires test files or test runner commands.
 - **sql.js over better-sqlite3** — Pure WASM avoids native module ABI mismatches when Claude Code (Bun-based) spawns MCP servers
 - **FTS4 over FTS5** — sql.js doesn't ship FTS5; standalone FTS4 tables (not content-linked) avoid transaction conflicts
-- **All extraction at index time** — No LLM calls. Decisions, tags, scores computed via regex/heuristic patterns during indexing
+- **NLP for text analysis** — compromise for sentence boundaries (handles abbreviations, code, URLs), wink-sentiment for user feedback classification (AFINN-165 lexicon). Both deterministic and pure JS.
 - **Connect before index** — MCP stdio transport connects immediately; incremental indexing runs in background
+
+## Dependencies
+
+| Package | Purpose | Size |
+|---------|---------|------|
+| `@modelcontextprotocol/sdk` | MCP server protocol | — |
+| `sql.js` | SQLite via WASM | — |
+| `zod` | Schema validation | — |
+| `compromise` | Sentence splitting, POS tagging | 2.6 MB |
+| `wink-sentiment` | AFINN-165 sentiment analysis | 332 KB |
 
 ## License
 

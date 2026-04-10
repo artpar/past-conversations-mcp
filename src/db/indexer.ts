@@ -6,7 +6,8 @@ import { streamHistory } from "../parser/history.js";
 import { discoverProjects, listSubagentFiles } from "../parser/project.js";
 import { parseSubagentFile } from "../parser/subagent.js";
 import { extractKnowledge } from "../parser/extractor.js";
-import { scoreMessage, computeSessionOutcome, computeSessionImportance } from "../utils/scoring.js";
+import { scoreMessage, scoreTurn, computeSessionOutcome, computeSessionImportance } from "../utils/scoring.js";
+import type { TurnContext } from "../utils/scoring.js";
 import { slugToPath } from "../utils/paths.js";
 import { HISTORY_FILE } from "../utils/paths.js";
 import type { IndexStats } from "../types.js";
@@ -171,6 +172,10 @@ export async function buildIndex(db: Database): Promise<IndexStats> {
     insights: Array<{ type: string; summary: string; detail: string; confidence: number; sourceIndex: number }>;
     tags: string[];
     crossRefs: Array<{ targetProject: string; type: string; context: string; messageIndex: number }>;
+    // Turn-based data (only for full-transcript sessions)
+    turns?: import("../parser/jsonl.js").ParsedTurn[];
+    errorFixPairs?: Array<{ errorTurnIndex: number; fixTurnIndex: number }>;
+    commitTurnIndices?: number[];
   };
 
   const sessionsToInsert: SessionData[] = [];
@@ -260,6 +265,9 @@ export async function buildIndex(db: Database): Promise<IndexStats> {
             insights: extraction.insights,
             tags: extraction.tags,
             crossRefs: extraction.crossRefs,
+            turns: parsed.turns,
+            errorFixPairs: parsed.errorFixPairs,
+            commitTurnIndices: parsed.commitTurnIndices,
           });
         } catch (err) {
           console.error(`[indexer] Error parsing ${session.jsonlPath}: ${err}`);
@@ -393,24 +401,103 @@ export async function buildIndex(db: Database): Promise<IndexStats> {
         s.outcome, s.errorCount, s.commitCount, s.totalTokens, s.durationSeconds, s.importanceScore
       );
 
-      // Score and insert messages
-      const totalMessages = s.messages.length;
-      const lastAssistantIdx = (() => {
-        for (let i = s.messages.length - 1; i >= 0; i--) {
-          if (s.messages[i].role === 'assistant') return i;
+      // Score messages using turn-based scoring when available
+      if (s.turns && s.turns.length > 0) {
+        // Build turn context lookup tables
+        const fixTurnSet = new Set((s.errorFixPairs ?? []).map(p => p.fixTurnIndex));
+        const preCommitSet = new Set<number>();
+        for (const ci of (s.commitTurnIndices ?? [])) {
+          if (ci - 1 >= 0) preCommitSet.add(ci - 1);
+          if (ci - 2 >= 0) preCommitSet.add(ci - 2);
         }
-        return -1;
-      })();
+        const totalTurns = s.turns.length;
 
-      for (let i = 0; i < s.messages.length; i++) {
-        const msg = s.messages[i];
-        const isLastAssistant = i === lastAssistantIdx;
-        const { importance, messageType } = scoreMessage(
-          msg.content, msg.role, msg.messageIndex, totalMessages, isLastAssistant,
-        );
-        insertMessage.run(s.sessionId, msg.role, msg.content, msg.timestamp, msg.messageIndex, importance, messageType);
-        insertMessageFts.run(s.sessionId, msg.role, msg.content, String(msg.messageIndex));
-        messagesCount++;
+        // Score each turn, then map scores to all flat messages in that turn.
+        // A turn may produce multiple flat messages (one user text + N assistant text blocks).
+        // We track which flat messageIndex range each turn covers.
+        const turnScoreByTurn: Array<{
+          userScore: { importance: number; messageType: string } | null;
+          assistantScore: { importance: number; messageType: string } | null;
+        }> = [];
+
+        for (let ti = 0; ti < s.turns.length; ti++) {
+          const turn = s.turns[ti];
+          const nextTurn = ti + 1 < totalTurns ? s.turns[ti + 1] : null;
+
+          const ctx: TurnContext = {
+            stopReason: turn.stopReason,
+            hasThinking: turn.hasThinking,
+            toolCallCount: turn.assistantToolCalls.length,
+            toolResultErrors: turn.toolResultErrors,
+            toolResultSuccesses: turn.toolResultSuccesses,
+            userFeedbackBefore: turn.userFeedback,
+            userFeedbackAfter: nextTurn?.userFeedback ?? null,
+            isErrorFixResolution: fixTurnSet.has(ti),
+            isPreCommit: preCommitSet.has(ti),
+            isPostUserRejection: turn.userFeedback === 'negative' || (ti > 0 && s.turns[ti - 1]?.userFeedback === 'negative'),
+            turnIndex: ti,
+            totalTurns,
+            isLastTurn: ti === totalTurns - 1,
+          };
+
+          const userScore = turn.userContent
+            ? { importance: ti === 0 ? 0.6 : 0.4, messageType: 'question' as string }
+            : null;
+
+          const assistantScore = turn.assistantText
+            ? scoreTurn(turn.assistantText, ctx)
+            : null;
+
+          turnScoreByTurn.push({ userScore, assistantScore });
+        }
+
+        // Map flat messages to their turn's score.
+        // Flat messages and turns align: a user text message starts a new turn,
+        // all subsequent assistant messages belong to that turn until the next user text.
+        let activeTurnIdx = -1;
+        let userTurnCount = 0;
+        for (const msg of s.messages) {
+          let score: { importance: number; messageType: string };
+
+          if (msg.role === 'user') {
+            // Advance to next turn that has userContent
+            for (let t = activeTurnIdx + 1; t < turnScoreByTurn.length; t++) {
+              if (turnScoreByTurn[t].userScore) {
+                activeTurnIdx = t;
+                break;
+              }
+            }
+            score = turnScoreByTurn[activeTurnIdx]?.userScore ?? { importance: userTurnCount === 0 ? 0.6 : 0.4, messageType: 'question' };
+            userTurnCount++;
+          } else {
+            // Assistant messages get the active turn's assistant score
+            score = (activeTurnIdx >= 0 ? turnScoreByTurn[activeTurnIdx]?.assistantScore : null) ?? { importance: 0.3, messageType: 'content' };
+          }
+
+          insertMessage.run(s.sessionId, msg.role, msg.content, msg.timestamp, msg.messageIndex, score.importance, score.messageType);
+          insertMessageFts.run(s.sessionId, msg.role, msg.content, String(msg.messageIndex));
+          messagesCount++;
+        }
+      } else {
+        // Fallback: legacy message-level scoring for subagent/history paths
+        const totalMessages = s.messages.length;
+        const lastAssistantIdx = (() => {
+          for (let i = s.messages.length - 1; i >= 0; i--) {
+            if (s.messages[i].role === 'assistant') return i;
+          }
+          return -1;
+        })();
+
+        for (let i = 0; i < s.messages.length; i++) {
+          const msg = s.messages[i];
+          const isLastAssistant = i === lastAssistantIdx;
+          const { importance, messageType } = scoreMessage(
+            msg.content, msg.role, msg.messageIndex, totalMessages, isLastAssistant,
+          );
+          insertMessage.run(s.sessionId, msg.role, msg.content, msg.timestamp, msg.messageIndex, importance, messageType);
+          insertMessageFts.run(s.sessionId, msg.role, msg.content, String(msg.messageIndex));
+          messagesCount++;
+        }
       }
 
       for (const tu of s.toolUses) {
