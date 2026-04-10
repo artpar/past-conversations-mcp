@@ -1,0 +1,42 @@
+{
+  "name": "past-conversations-mcp",
+  "version": "2.0.2",
+  "description": "MCP server for searching and querying Claude Code past conversations for KT across sessions",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "past-conversations-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "claude-code",
+    "conversations",
+    "search",
+    "knowledge-transfer"
+  ],
+  "author": "artpar",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/artpar/past-conversations-mcp"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "sql.js": "^1.11.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
